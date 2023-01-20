@@ -1,4 +1,4 @@
-use bytes::{BytesMut, BufMut};
+use bytes::{BufMut, BytesMut};
 
 use futures::future::join_all;
 
@@ -36,10 +36,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let token_clone = token.clone();
 
     let jh = tokio::spawn(async move {
-        handle_connection(pid, listener, postfix, token_clone).await.expect("failed to handle connection");
+        handle_connection(pid, listener, postfix, token_clone)
+            .await
+            .expect("failed to handle connection");
     });
 
-    signal_stream.recv().await.ok_or("error in handling signal")?;
+    signal_stream
+        .recv()
+        .await
+        .ok_or("error in handling signal")?;
     println!("Process {pid} received hangup signal");
     token.cancel();
 
@@ -48,12 +53,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-
 async fn handle_connection(
     pid: u32,
     listener: TcpListener,
     postfix: String,
-    cancellation_token: CancellationToken
+    cancellation_token: CancellationToken,
 ) -> Result<(), Box<dyn Error>> {
     let mut tasks = vec![];
     let postfix = Arc::new(postfix);
@@ -69,7 +73,7 @@ async fn handle_connection(
                 join_all(tasks).await;
                 break;
             }
-            
+
             Ok((mut socket, addr)) = listener.accept() => {
                 println!("Process {pid} accepted connection from: {addr}");
 
@@ -77,7 +81,7 @@ async fn handle_connection(
 
                 tasks.push(tokio::spawn(async move {
                     let mut buf = BytesMut::with_capacity(1024);
-        
+
                     loop {
                         let n = socket
                             .read_buf(&mut buf)
@@ -87,9 +91,9 @@ async fn handle_connection(
                         if n == 0 {
                             break;
                         }
-                            
+
                         buf.put(&postfix_clone.as_bytes()[..]);
-                        
+
                         socket
                             .write_buf(&mut buf)
                             .await
