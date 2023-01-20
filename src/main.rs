@@ -3,7 +3,7 @@ use bytes::{BufMut, BytesMut};
 use futures::future::join_all;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpSocket};
+use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
@@ -22,15 +22,37 @@ const CLEAN_INTERVAL: u64 = 5;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let pid = process::id();
-
     println!("Process {pid} running");
-
-    let postfix = format!(": from {pid}\n");
 
     let addr = env::args()
         .nth(1)
         .unwrap_or_else(|| "127.0.0.1:8080".to_string());
 
+    let token = CancellationToken::new();
+    let token_clone = token.clone();
+
+    let server = start_server(pid, addr, token_clone).await?;
+
+    wait_for_signal(pid, token).await?;
+
+    server.await?;
+
+    Ok(())
+}
+
+async fn wait_for_signal(pid: u32, token: CancellationToken) -> Result<(), Box<dyn Error>> {
+    let mut signal_stream = signal(SignalKind::hangup())?;
+    signal_stream.recv().await.ok_or("can't catch the signal")?;
+    println!("Process {pid} received hangup signal");
+    token.cancel();
+    Ok(())
+}
+
+async fn start_server(
+    pid: u32,
+    addr: String,
+    token: CancellationToken,
+) -> Result<JoinHandle<()>, Box<dyn Error>> {
     let socket = TcpSocket::new_v4()?;
     socket.set_reuseaddr(true)?;
     socket.set_reuseport(true)?;
@@ -38,26 +60,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let listener = socket.listen(MAX_LISTENERS)?;
     println!("Process {pid} listening on: {}", addr);
 
-    let mut signal_stream = signal(SignalKind::hangup())?;
-    let token = CancellationToken::new();
-    let token_clone = token.clone();
-
-    let jh = tokio::spawn(async move {
-        handle_connection(pid, listener, postfix, token_clone)
+    let server = tokio::spawn(async move {
+        handle_connection(pid, listener, token)
             .await
             .expect("failed to handle connection");
     });
 
-    signal_stream
-        .recv()
-        .await
-        .ok_or("error in handling signal")?;
-    println!("Process {pid} received hangup signal");
-    token.cancel();
-
-    jh.await?;
-
-    Ok(())
+    Ok(server)
 }
 
 #[derive(Default)]
@@ -83,36 +92,26 @@ impl<T> Tasks<T> {
     }
 }
 
+type SharedTasks<T> = Arc<Mutex<Tasks<T>>>;
+
 async fn handle_connection(
     pid: u32,
     listener: TcpListener,
-    postfix: String,
-    cancellation_token: CancellationToken,
+    token: CancellationToken,
 ) -> Result<(), Box<dyn Error>> {
-    let tasks = Arc::new(Mutex::new(Tasks::default()));
+    let tasks = SharedTasks::default();
 
-    let cancellation_token_clone = cancellation_token.clone();
+    let token_clone = token.clone();
     let tasks_clone = Arc::clone(&tasks);
     let remove_finished_tasks_worker = tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                _ = cancellation_token_clone.cancelled() => {
-                    break;
-                }
-
-                _ = sleep(Duration::from_secs(CLEAN_INTERVAL)) => {
-                    let mut tasks = tasks_clone.lock().await;
-                    tasks.remove_finished_tasks();
-                }
-            }
-        }
+        task_cleanup_worker(token_clone, tasks_clone).await;
     });
 
-    let postfix = Arc::new(postfix);
+    let postfix = Arc::new(format!(": from {pid}\n"));
 
     loop {
         tokio::select! {
-            _ = cancellation_token.cancelled() => {
+            _ = token.cancelled() => {
                 // do not accept new connections
                 drop(listener);
 
@@ -132,25 +131,7 @@ async fn handle_connection(
 
                 let mut tasks = tasks.lock().await;
                 tasks.add(tokio::spawn(async move {
-                    let mut buf = BytesMut::with_capacity(BUFFER_SIZE);
-
-                    loop {
-                        let n = socket
-                            .read_buf(&mut buf)
-                            .await
-                            .expect("failed to read data from socket");
-
-                        if n == 0 {
-                            break;
-                        }
-
-                        buf.put(postfix_clone.as_bytes());
-
-                        socket
-                            .write_buf(&mut buf)
-                            .await
-                            .expect("failed to write data to socket");
-                    }
+                    protocol(&mut socket, postfix_clone).await.expect("failed to handle protocol");
                 }));
             }
 
@@ -161,4 +142,41 @@ async fn handle_connection(
     }
 
     Ok(())
+}
+
+async fn protocol(stream: &mut TcpStream, postfix: Arc<String>) -> Result<(), Box<dyn Error>> {
+    let mut buf = BytesMut::with_capacity(BUFFER_SIZE);
+
+    loop {
+        let n = stream
+            .read_buf(&mut buf)
+            .await?;
+
+        if n == 0 {
+            break;
+        }
+
+        buf.put(postfix.as_bytes());
+
+        stream
+            .write_buf(&mut buf)
+            .await?;
+    }
+
+    Ok(())
+}
+
+async fn task_cleanup_worker<T>(token: CancellationToken, tasks: SharedTasks<T>) {
+    loop {
+        tokio::select! {
+            _ = token.cancelled() => {
+                break;
+            }
+
+            _ = sleep(Duration::from_secs(CLEAN_INTERVAL)) => {
+                let mut tasks = tasks.lock().await;
+                tasks.remove_finished_tasks();
+            }
+        }
+    }
 }
