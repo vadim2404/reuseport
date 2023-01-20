@@ -61,12 +61,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
 }
 
 #[derive(Default)]
-struct Tasks {
-    tasks: Vec<JoinHandle<()>>,
+struct Tasks<T> {
+    tasks: Vec<JoinHandle<T>>,
 }
 
-impl Tasks {
-    fn add(&mut self, task: JoinHandle<()>) {
+impl<T> Tasks<T> {
+    fn add(&mut self, task: JoinHandle<T>) {
         self.tasks.push(task);
     }
 
@@ -93,7 +93,7 @@ async fn handle_connection(
 
     let cancellation_token_clone = cancellation_token.clone();
     let tasks_clone = Arc::clone(&tasks);
-    let remove_finish_tasks = tokio::spawn(async move {
+    let remove_finished_tasks_worker = tokio::spawn(async move {
         loop {
             tokio::select! {
                 _ = cancellation_token_clone.cancelled() => {
@@ -117,7 +117,7 @@ async fn handle_connection(
                 drop(listener);
 
                 // wait until all other connections are closed
-                let _ = remove_finish_tasks.await;
+                let _ = remove_finished_tasks_worker.await;
 
                 let mut tasks = tasks.lock().await;
                 println!("process {pid} closing tasks: {}", tasks.len());
